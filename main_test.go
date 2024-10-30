@@ -26,6 +26,8 @@ func newMaskedCloseFrame(code StatusCode, message string) []byte {
 	frame = append(frame, code.Bytes()...)
 	frame = append(frame, message...)
 
+	applyMask(frame[6:], mask)
+
 	return frame
 }
 
@@ -65,7 +67,7 @@ func TestControlFrameLargePayloadError(t *testing.T) {
 // in the tests instead
 
 func TestNewCloseFrame(t *testing.T) {
-	isServer := false
+	isServer := true
 	frameData := newMaskedCloseFrame(Done, "message!")
 	f, err := NewFrame(frameData, isServer)
 	if err != nil {

@@ -55,12 +55,13 @@ type ConnState struct {
 }
 
 type Frame struct {
-	final      bool
-	opcode     Opcode
-	mask       bool
-	payloadLen uint
-	maskingKey []byte
-	appData    []byte
+	final         bool
+	opcode        Opcode
+	mask          bool
+	payloadLen    uint
+	maskingKey    []byte
+	appData       []byte
+	maskedAppData []byte
 }
 
 func (f *Frame) Bytes() []byte {
@@ -163,6 +164,12 @@ func NewFrame(bytes []byte, isServer bool) (*Frame, error) {
 
 	appData := bytes[bufCursor : bufCursor+payloadLen]
 
+	var maskedAppData []byte
+	if hasMask {
+		maskedAppData = append(maskedAppData, appData...)
+		applyMask(appData, maskingKey)
+	}
+
 	if isControl {
 		if !isFinal {
 			err := errors.New("control frames cannot be fragmented")
@@ -175,12 +182,13 @@ func NewFrame(bytes []byte, isServer bool) (*Frame, error) {
 	}
 
 	frame := &Frame{
-		final:      isFinal,
-		opcode:     opcode,
-		mask:       hasMask,
-		payloadLen: payloadLen,
-		maskingKey: maskingKey,
-		appData:    appData,
+		final:         isFinal,
+		opcode:        opcode,
+		mask:          hasMask,
+		payloadLen:    payloadLen,
+		maskingKey:    maskingKey,
+		appData:       appData,
+		maskedAppData: maskedAppData,
 	}
 
 	return frame, nil
@@ -366,6 +374,7 @@ func handleFrames(connState ConnState) {
 					fmt.Printf("Sending ConnectionClose frame failed, err: %s\n", err.Error())
 					return
 				}
+				connState.isClosing = true
 			}
 		}
 	}
