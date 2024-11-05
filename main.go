@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"time"
 )
@@ -16,12 +17,12 @@ import (
 type Opcode byte
 
 const (
-	ContinuationFrame Opcode = 0
-	TextFrame         Opcode = 1
-	BinaryFrame       Opcode = 2
-	ConnectionClose   Opcode = 8
-	Ping              Opcode = 9
-	Pong              Opcode = 10
+	Continuation    Opcode = 0
+	Text            Opcode = 1
+	Binary          Opcode = 2
+	ConnectionClose Opcode = 8
+	Ping            Opcode = 9
+	Pong            Opcode = 10
 )
 
 type StatusCode uint16
@@ -49,9 +50,10 @@ func (sc StatusCode) Bytes() []byte {
 
 type ConnState struct {
 	//conn      net.Conn
-	r         io.Reader
-	w         io.Writer
-	isClosing bool
+	r             io.Reader
+	w             io.Writer
+	pendingFrames []*Frame
+	isClosing     bool
 }
 
 type Frame struct {
@@ -161,6 +163,11 @@ func NewFrame(bytes []byte, isServer bool) (*Frame, error) {
 	}
 
 	// todo	extension data
+
+	if uint(len(bytes)) != bufCursor+payloadLen {
+		err := errors.New(fmt.Sprintf("payload doesn't match payloadLen, expected: %d, got: %d", payloadLen, len(bytes)))
+		return nil, err
+	}
 
 	appData := bytes[bufCursor : bufCursor+payloadLen]
 
@@ -311,22 +318,35 @@ func createCloseFrame(
 	code StatusCode,
 	reason string,
 ) Frame {
-	var f = Frame{
+	f := Frame{
 		final:      true,
 		opcode:     ConnectionClose,
 		mask:       false,
 		payloadLen: uint(2 + len(reason)),
-		maskingKey: []byte{},
+		maskingKey: nil,
 		appData:    append(code.Bytes(), reason...),
+	}
+	return f
+}
+
+func createPongFrame(ping *Frame) Frame {
+	f := Frame{
+		final:         true,
+		opcode:        Pong,
+		mask:          false,
+		payloadLen:    ping.payloadLen,
+		maskingKey:    nil,
+		appData:       ping.appData,
+		maskedAppData: nil,
 	}
 	return f
 }
 
 var isServer = true
 
-func handleFrames(connState ConnState) {
-	r := connState.r
-	//w := connState.w
+func handleFrames(cs ConnState) {
+	r := cs.r
+	//w := cs.w
 	for {
 		buf := make([]byte, 1024)
 		n, err := r.Read(buf)
@@ -338,7 +358,8 @@ func handleFrames(connState ConnState) {
 			}
 			return
 		}
-		fmt.Printf("Received: %s\n", string(buf[:n]))
+		buf = buf[:n]
+		fmt.Printf("Received: %s\n", string(buf))
 
 		f, err := NewFrame(buf, !isServer)
 		if err != nil {
@@ -361,7 +382,7 @@ func handleFrames(connState ConnState) {
 				the middle of sending a fragmented message, we may choose to send the remaining fragments
 				and only then close the connection
 			*/
-			if connState.isClosing {
+			if cs.isClosing {
 				fmt.Printf("Closing connection\n")
 				return
 			} else {
@@ -370,22 +391,115 @@ func handleFrames(connState ConnState) {
 				frame := createCloseFrame(code, "")
 				fmt.Printf("Sending ConnectionClose frame\n")
 
-				if err := connState.SendFrame(frame); err != nil {
+				if err := cs.SendFrame(frame); err != nil {
 					fmt.Printf("Sending ConnectionClose frame failed, err: %s\n", err.Error())
 					return
 				}
-				connState.isClosing = true
+				cs.isClosing = true
 			}
+		} else if f.opcode == Ping {
+			if cs.isClosing {
+				continue
+			}
+
+			frame := createPongFrame(f)
+			if err := cs.SendFrame(frame); err != nil {
+				fmt.Printf("Sending Pong frame failed, err: %s\n", err.Error())
+				return
+			}
+		} else if f.opcode == Pong {
+			// do not process, but refresh any keepalive that this conn might have
+		} else if f.opcode == Continuation {
+			if len(cs.pendingFrames) == 0 {
+				fmt.Println("Received continuation frame but didn't have any pending messages")
+				return
+			}
+
+			cs.pendingFrames = append(cs.pendingFrames, f)
+			if f.final {
+				cs.processPendingFragmentedMessages()
+			}
+		} else if !f.final {
+			if len(cs.pendingFrames) != 0 {
+				fmt.Println("Received new fragmented message but already had a pending message")
+				return
+			}
+			cs.pendingFrames = []*Frame{f}
+		} else {
+			cs.processMessage(f)
 		}
+	}
+}
+
+func (cs *ConnState) processPendingFragmentedMessages() {
+	frames := cs.pendingFrames
+
+	appData := make([]byte, 0)
+	for _, f := range frames {
+		appData = append(appData, f.appData...)
+	}
+
+	cs.processMessagePayload(frames[0].opcode == Text, appData, math.MaxInt)
+
+	cs.pendingFrames = nil
+}
+
+func (cs *ConnState) processMessage(f *Frame) {
+	cs.processMessagePayload(f.opcode == Text, f.appData, 16)
+}
+
+func (cs *ConnState) processMessagePayload(
+	isText bool,
+	appData []byte,
+	maxPayloadLenPerFrame int,
+) {
+	// todo	debug
+	opcode := Text
+	if !isText {
+		opcode = Binary
+	}
+	msgLen := len(appData)
+	frameMsgLen := maxPayloadLenPerFrame
+
+	for dataSent := 0; dataSent < len(appData); {
+		final := false
+		from := dataSent
+		to := dataSent + frameMsgLen
+
+		if to >= msgLen {
+			final = true
+			to = msgLen
+		}
+		if dataSent != 0 {
+			opcode = Continuation
+		}
+		f := Frame{
+			final:         final,
+			opcode:        opcode,
+			mask:          false,
+			payloadLen:    uint(to - from),
+			maskingKey:    nil,
+			appData:       appData[from:to],
+			maskedAppData: nil,
+		}
+		if err := cs.SendFrame(f); err != nil {
+			fmt.Printf("Sending fragmented frame failed, err: %s\n", err.Error())
+			return
+		}
+		time.Sleep(2 * time.Second)
+		dataSent = to
 	}
 }
 
 func (cs *ConnState) SendFrame(f Frame) error {
 	data := f.Bytes()
 	fmt.Printf("SendFrame data: %08b\n", data)
+	start := time.Now()
 	if _, err := cs.w.Write(data); err != nil {
 		return err
 	}
+	elapsed := time.Now().UnixMilli() - start.UnixMilli()
+	fmt.Printf("SendFrame took: %d ms\n", elapsed)
 	return nil
 }
 
